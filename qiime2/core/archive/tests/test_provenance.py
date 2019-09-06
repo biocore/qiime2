@@ -96,15 +96,16 @@ class TestProvenanceIntegration(unittest.TestCase):
 
         p_dir = c._archiver.provenance_dir
 
-        yaml_value = "%s,%s:metadata.tsv" % (md_artifact1.uuid,
-                                             md_artifact2.uuid)
+        yaml_value = "%s:metadata.tsv" % (md_artifact2.uuid)
 
         # Check action files for uuid-metadata values
         with (p_dir / 'action' / 'action.yaml').open() as fh:
             self.assertIn(yaml_value, fh.read())
         with (p_dir / 'artifacts' / str(b.uuid) / 'action' /
               'action.yaml').open() as fh:
-            self.assertIn(yaml_value, fh.read())
+            read = fh.read()
+            self.assertIn(str(md_artifact1.uuid), read)
+            self.assertIn(str(md_artifact2.uuid), read)
 
         # Check that metadata is written out fully
         with (p_dir / 'action' / 'metadata.tsv').open() as fh:

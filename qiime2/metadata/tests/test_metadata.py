@@ -412,41 +412,36 @@ class TestSourceArtifacts(unittest.TestCase):
         self.assertEqual(self.md.artifacts, ())
 
     def test_add_zero_artifacts(self):
-        self.md._add_artifacts([])
+        self.md._source_artifact = None
 
         self.assertEqual(self.md.artifacts, ())
 
-    def test_add_artifacts(self):
-        # First two artifacts have the same data but different UUIDs.
-        artifact1 = Artifact.import_data('Mapping', {'a': '1', 'b': '3'})
-        self.md._add_artifacts([artifact1])
+    def test_source_artifacts(self):
+        artifact1 = Artifact.import_data('Mapping', {'a': '1', 'b': '2'})
+        md1 = artifact1.view(Metadata)
 
-        artifact2 = Artifact.import_data('Mapping', {'a': '1', 'b': '3'})
-        artifact3 = Artifact.import_data('IntSequence1', [1, 2, 3, 4])
-        self.md._add_artifacts([artifact2, artifact3])
+        artifact2 = Artifact.import_data('Mapping', {'a': '3', 'b': '4'})
+        md2 = artifact2.view(Metadata)
 
-        self.assertEqual(self.md.artifacts, (artifact1, artifact2, artifact3))
+        artifact3 = Artifact.import_data('Mapping', {'c': '5', 'd': '6'})
+        md3 = artifact3.view(Metadata)
+        self.assertEqual(artifact3, md3._source_artifact)
+
+        merged_md = md1.merge(md2, md3)
+        # The artifacts do not come out in a completely deterministic order in
+        # the tuple, it's alphabetical by column name which varies with the
+        # ids
+        self.assertEqual(len(merged_md.artifacts), 3)
+        self.assertIn(artifact1, merged_md.artifacts)
+        self.assertIn(artifact2, merged_md.artifacts)
+        self.assertIn(artifact3, merged_md.artifacts)
 
     def test_add_non_artifact(self):
-        artifact = Artifact.import_data('Mapping', {'a': '1', 'b': '3'})
-
         with self.assertRaisesRegex(TypeError, "Artifact object.*42"):
-            self.md._add_artifacts([artifact, 42])
+            self.md._add_source_artifact(42)
 
         # Test that the object hasn't been mutated.
         self.assertEqual(self.md.artifacts, ())
-
-    def test_add_duplicate_artifact(self):
-        artifact1 = Artifact.import_data('Mapping', {'a': '1', 'b': '3'})
-        artifact2 = Artifact.import_data('IntSequence1', [1, 2, 3, 4])
-        self.md._add_artifacts([artifact1, artifact2])
-
-        with self.assertRaisesRegex(
-                ValueError, "Duplicate source artifacts.*artifact: Mapping"):
-            self.md._add_artifacts([artifact1])
-
-        # Test that the object hasn't been mutated.
-        self.assertEqual(self.md.artifacts, (artifact1, artifact2))
 
 
 class TestRepr(unittest.TestCase):
@@ -727,7 +722,7 @@ class TestGetColumn(unittest.TestCase):
 
         exp = CategoricalMetadataColumn(
             pd.Series(['3'], name='b', index=pd.Index(['0'], name='id')))
-        exp._add_artifacts([A])
+        exp._source_metadata = md
 
         self.assertEqual(obs, exp)
         self.assertEqual(obs.artifacts, (A,))
@@ -968,6 +963,7 @@ class TestMerge(unittest.TestCase):
             {'a': [1, 2, 3], 'b': [4, 5, 6],
              'c': [7, 8, 9], 'd': [10, 11, 12]},
             index=pd.Index(['id1', 'id2', 'id3'], name='id')))
+
         self.assertEqual(obs, exp)
 
     def test_merging_three(self):
@@ -1072,7 +1068,7 @@ class TestMerge(unittest.TestCase):
         md2 = Metadata(pd.DataFrame({},
                        index=pd.Index(['id2', 'X', 'id1'], name='id')))
         md3 = Metadata(pd.DataFrame({},
-                       index=pd.Index(['id1', 'id3', 'id2'], name='id')))
+                       index=pd.Index(['id1', 'A', 'id2'], name='id')))
 
         obs = md1.merge(md2, md3)
 
@@ -1142,15 +1138,19 @@ class TestMerge(unittest.TestCase):
         # Merge three metadata objects -- the first has an artifact, the second
         # does not, and the third has an artifact.
         obs_md = md_from_artifact1.merge(md_no_artifact, md_from_artifact2)
-
         exp_df = pd.DataFrame(
             {'a': '1', 'b': '2', 'c': '3', 'd': '4'},
             index=pd.Index(['0'], name='id'))
         exp_md = Metadata(exp_df)
-        exp_md._add_artifacts((artifact1, artifact2))
+        exp_md._column_sources = {'a': md_from_artifact1,
+                                  'b': md_from_artifact1,
+                                  'c': md_no_artifact,
+                                  'd': md_from_artifact2}
 
-        self.assertEqual(obs_md, exp_md)
-        self.assertEqual(obs_md.artifacts, (artifact1, artifact2))
+        self.assertEqual(exp_md, obs_md)
+        self.assertEqual(2, len(obs_md.artifacts))
+        self.assertIn(artifact1, obs_md.artifacts)
+        self.assertIn(artifact2, obs_md.artifacts)
 
     def test_disjoint_indices(self):
         md1 = Metadata(pd.DataFrame(
@@ -1171,16 +1171,13 @@ class TestMerge(unittest.TestCase):
             {'c': [5, 6], 'b': [7, 8]},
             index=pd.Index(['id1', 'id2'], name='id')))
 
-        with self.assertRaisesRegex(ValueError, "columns overlap: 'b'"):
-            md1.merge(md2)
-
-    def test_duplicate_columns_self_merge(self):
-        md = Metadata(pd.DataFrame(
-            {'a': [1, 2], 'b': [3, 4]},
+        exp = Metadata(pd.DataFrame(
+            {'a': [1, 2], 'b [31b345c7b509cf1a0bb0d8f56c8e08b2]': [3, 4],
+             'c': [5, 6], 'b [af19e323d6b6f4feb8baaf5c5c6f1221]': [7, 8]},
             index=pd.Index(['id1', 'id2'], name='id')))
 
-        with self.assertRaisesRegex(ValueError, "columns overlap: 'a', 'b'"):
-            md.merge(md)
+        obs = md1.merge(md2)
+        self.assertEqual(obs, exp)
 
 
 class TestFilterIDs(unittest.TestCase):
@@ -1296,25 +1293,6 @@ class TestFilterIDs(unittest.TestCase):
         filtered = md.filter_ids({'b'})
 
         self.assertEqual(filtered.artifacts, ())
-
-    def test_with_artifacts(self):
-        artifact1 = Artifact.import_data('Mapping', {'a': '1', 'b': '2'})
-        artifact2 = Artifact.import_data('Mapping', {'d': '4'})
-
-        md = Metadata(pd.DataFrame(
-            {'col1': [1, 2, 3], 'col2': ['foo', 'bar', 'baz']},
-            index=pd.Index(['a', 'b', 'c'], name='id')))
-        md._add_artifacts([artifact1, artifact2])
-
-        obs = md.filter_ids({'a', 'c'})
-
-        exp = Metadata(pd.DataFrame(
-            {'col1': [1, 3], 'col2': ['foo', 'baz']},
-            index=pd.Index(['a', 'c'], name='id')))
-        exp._add_artifacts([artifact1, artifact2])
-
-        self.assertEqual(obs, exp)
-        self.assertEqual(obs.artifacts, (artifact1, artifact2))
 
     def test_empty_ids_to_keep(self):
         md = Metadata(pd.DataFrame(
@@ -1534,25 +1512,6 @@ class TestFilterColumns(unittest.TestCase):
         filtered = md.filter_columns(column_type='categorical')
 
         self.assertEqual(filtered.artifacts, ())
-
-    def test_with_artifacts(self):
-        artifact1 = Artifact.import_data('Mapping', {'a': '1', 'b': '2'})
-        artifact2 = Artifact.import_data('Mapping', {'d': '4'})
-
-        md = Metadata(pd.DataFrame(
-            {'col1': [1, 2, 3], 'col2': ['foo', 'bar', 'baz']},
-            index=pd.Index(['a', 'b', 'c'], name='id')))
-        md._add_artifacts([artifact1, artifact2])
-
-        obs = md.filter_columns(column_type='categorical')
-
-        exp = Metadata(pd.DataFrame(
-            {'col2': ['foo', 'bar', 'baz']},
-            index=pd.Index(['a', 'b', 'c'], name='id')))
-        exp._add_artifacts([artifact1, artifact2])
-
-        self.assertEqual(obs, exp)
-        self.assertEqual(obs.artifacts, (artifact1, artifact2))
 
 
 if __name__ == '__main__':

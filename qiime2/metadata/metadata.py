@@ -8,7 +8,10 @@
 
 import abc
 import collections
-import itertools
+import uuid
+import tempfile
+import copy
+
 import sqlite3
 import types
 import warnings
@@ -17,7 +20,7 @@ import pandas as pd
 import numpy as np
 
 import qiime2
-from qiime2.core.util import find_duplicates
+from qiime2.core.util import find_duplicates, md5sum
 from .base import SUPPORTED_COLUMN_TYPES, FORMATTED_ID_HEADERS, is_id_header
 
 
@@ -73,20 +76,6 @@ class _MetadataBase:
         """
         return len(self._ids)
 
-    @property
-    def artifacts(self):
-        """Artifacts that are the source of the metadata.
-
-        This property is read-only.
-
-        Returns
-        -------
-        tuple of qiime2.Artifact
-            Source artifacts of the metadata.
-
-        """
-        return tuple(self._artifacts)
-
     def __init__(self, index):
         if index.empty:
             raise ValueError(
@@ -99,32 +88,14 @@ class _MetadataBase:
         self._validate_index(index, axis='id')
         self._ids = tuple(index)
 
-        self._artifacts = []
-
     def __eq__(self, other):
         return (
             isinstance(other, self.__class__) and
-            self._id_header == other._id_header and
-            self._artifacts == other._artifacts
+            self._id_header == other._id_header
         )
 
     def __ne__(self, other):
         return not (self == other)
-
-    def _add_artifacts(self, artifacts):
-        deduped = set(self._artifacts)
-        for artifact in artifacts:
-            if not isinstance(artifact, qiime2.Artifact):
-                raise TypeError(
-                    "Expected Artifact object, received %r" % artifact)
-            if artifact in deduped:
-                raise ValueError(
-                    "Duplicate source artifacts are not supported on %s "
-                    "objects. The following artifact is a duplicate of "
-                    "another source artifact: %r" %
-                    (self.__class__.__name__, artifact))
-            deduped.add(artifact)
-        self._artifacts.extend(artifacts)
 
     # Static helpers below for code reuse in Metadata and MetadataColumn
 
@@ -271,7 +242,7 @@ class Metadata(_MetadataBase):
         dataframe stored within the ``Metadata`` object will have any missing
         values normalized to ``np.nan``. Columns with ``dtype=int`` will be
         cast to ``dtype=float``. To obtain a dataframe from the ``Metadata``
-        object containing these normalized data types and values, use
+            object containing these normalized data types and values, use
         ``Metadata.to_dataframe()``.
 
     """
@@ -353,6 +324,48 @@ class Metadata(_MetadataBase):
         """
         return len(self._columns)
 
+    @property
+    def artifacts(self):
+        """Artifacts that are the source of the metadata.
+
+        This property is read-only.
+
+        Returns
+        -------
+        tuple of qiime2.Artifact
+            Source artifacts of the metadata.
+
+        """
+        if self._source_artifact is not None:
+            return (self._source_artifact,)
+
+        artifacts = set()
+        for source in self._column_sources.values():
+            if source is not None:
+                artifacts.update(artifact for artifact in source.artifacts)
+        return tuple(artifacts)
+
+    @property
+    def source_artifact(self):
+        """Artifact that is the source of the metadata.
+
+        This property is read-only.
+
+        Returns
+        -------
+        qiime2.Artifact
+            Source artifact of the metadata.
+
+        """
+        return self._source_artifact
+
+    # Try to ensure the source artifact is actually an artifact
+    def _add_source_artifact(self, artifact):
+        if not isinstance(artifact, qiime2.Artifact):
+            raise TypeError('Source Artifact must an Artifact object not '
+                            f'{artifact}.')
+        self._source_artifact = artifact
+
     def __init__(self, dataframe):
         if not isinstance(dataframe, pd.DataFrame):
             raise TypeError(
@@ -362,6 +375,36 @@ class Metadata(_MetadataBase):
         super().__init__(dataframe.index)
 
         self._dataframe, self._columns = self._normalize_dataframe(dataframe)
+        self.contains_renamed_columns = False
+
+        self._column_names = {}
+        self._column_sources = {}
+        for column in self._columns:
+            self._column_names[column] = column
+            self._column_sources[column] = None
+
+        # This is set post facto at the point of the creation of this metadata
+        # from an artifact
+        self._source_artifact = None
+
+    def _init(self, column_names, column_sources):
+        self._column_names = column_names
+        self._column_sources = column_sources
+
+    @property
+    def id(self):
+        if not isinstance(self._id, uuid.UUID):
+            return f'{self._id:x}'
+        else:
+            return self._id
+
+    @property
+    def _id(self):
+        if self._source_artifact is not None:
+            return self._source_artifact.uuid
+        with tempfile.NamedTemporaryFile(prefix='md5-') as fh:
+            self.save(fh.name)
+            return int(md5sum(fh.name), 16)
 
     def _normalize_dataframe(self, dataframe):
         self._validate_index(dataframe.columns, axis='column')
@@ -380,15 +423,16 @@ class Metadata(_MetadataBase):
         dtype = series.dtype
         if NumericMetadataColumn._is_supported_dtype(dtype):
             column = NumericMetadataColumn(series)
+            column._init(self)
         elif CategoricalMetadataColumn._is_supported_dtype(dtype):
             column = CategoricalMetadataColumn(series)
+            column._init(self)
         else:
             raise TypeError(
                 "Metadata column %r has an unsupported pandas dtype of %s. "
                 "Supported dtypes: float, int, object" %
                 (series.name, dtype))
 
-        column._add_artifacts(self.artifacts)
         return column
 
     def __repr__(self):
@@ -445,7 +489,8 @@ class Metadata(_MetadataBase):
         return (
             super().__eq__(other) and
             self._columns == other._columns and
-            self._dataframe.equals(other._dataframe)
+            self._dataframe.equals(other._dataframe) and
+            self._id == other._id
         )
 
     def __ne__(self, other):
@@ -668,24 +713,67 @@ class Metadata(_MetadataBase):
                 "this Metadata object (otherwise there is nothing to merge).")
 
         dfs = []
-        columns = []
-        artifacts = []
-        for md in itertools.chain([self], others):
+        column_names = []
+        column_sources = []
+        columns = {}
+        df_changes = {}
+
+        mds = [self]
+        mds.extend(others)
+        dupes = set()
+        for md in mds:
+            if md._id in dupes:
+                raise ValueError(
+                    'Your input contained duplicate metadata files. Merging '
+                    'the same file multiple times is not allowed.')
+            dupes.add(md._id)
+
+        for i, md in enumerate(mds):
             df = md._dataframe
             dfs.append(df)
-            columns.extend(df.columns.tolist())
-            artifacts.extend(md.artifacts)
+            names = copy.deepcopy(md._column_names)
+            column_names.append(names)
+            sources = copy.deepcopy(md._column_sources)
+            column_sources.append(sources)
+            items = names.items()
 
-        columns = pd.Index(columns)
-        if columns.has_duplicates:
-            raise ValueError(
-                "Cannot merge metadata with overlapping columns. The "
-                "following columns overlap: %s" %
-                ', '.join([repr(e) for e in
-                           columns[columns.duplicated()].unique()]))
+            for new_name, old_name in items:
+                if old_name not in columns:
+                    columns[old_name] = i
+
+                else:
+                    if old_name in column_names[columns[old_name]]:
+                        old_md_index = columns[old_name]
+                        modified_name = str(old_name) + \
+                            f' [{mds[old_md_index].id}]'
+
+                        if columns[old_name] not in df_changes:
+                            df_changes[old_md_index] = {}
+
+                        df_changes[old_md_index][old_name] = modified_name
+                        column_names[old_md_index][modified_name] = \
+                            column_names[old_md_index].pop(old_name)
+
+                        column_sources[old_md_index].pop(old_name)
+                        column_sources[old_md_index][modified_name] = \
+                            mds[old_md_index]
+
+                    if old_name == new_name:
+                        if i not in df_changes:
+                            df_changes[i] = {}
+                        df_changes[i][old_name] = str(old_name) + \
+                            f' [{mds[i].id}]'
+                        new_name = str(old_name) + f' [{mds[i].id}]'
+                        names[new_name] = names.pop(old_name)
+
+                if old_name in sources:
+                    sources.pop(old_name)
+                sources[new_name] = md
+
+        for change in df_changes:
+            dfs[change] = dfs[change].rename(columns=df_changes[change])
 
         merged_df = dfs[0].join(dfs[1:], how='inner')
-
         # Not using DataFrame.empty because empty columns are allowed in
         # Metadata.
         if merged_df.index.empty:
@@ -693,9 +781,13 @@ class Metadata(_MetadataBase):
                 "Cannot merge because there are no IDs shared across metadata "
                 "objects.")
 
+        column_names = {k: v for d in column_names for k, v in d.items()}
+        column_sources = {k: v for d in column_sources for k, v in d.items()}
         merged_df.index.name = 'id'
         merged_md = self.__class__(merged_df)
-        merged_md._add_artifacts(artifacts)
+        merged_md._init(column_names, column_sources)
+        if df_changes:
+            merged_md.contains_renamed_columns = True
         return merged_md
 
     def filter_ids(self, ids_to_keep):
@@ -726,7 +818,7 @@ class Metadata(_MetadataBase):
         filtered_df = self._filter_ids_helper(self._dataframe, self.get_ids(),
                                               ids_to_keep)
         filtered_md = self.__class__(filtered_df)
-        filtered_md._add_artifacts(self.artifacts)
+        filtered_md._init(self._column_names, self._column_sources)
         return filtered_md
 
     def filter_columns(self, *, column_type=None, drop_all_unique=False,
@@ -799,7 +891,7 @@ class Metadata(_MetadataBase):
         filtered_df = self._dataframe.drop(columns_to_drop, axis=1,
                                            inplace=False)
         filtered_md = self.__class__(filtered_df)
-        filtered_md._add_artifacts(self.artifacts)
+        filtered_md._init(self._column_names, self._column_sources)
         return filtered_md
 
 
@@ -862,6 +954,39 @@ class MetadataColumn(_MetadataBase, metaclass=abc.ABCMeta):
         """
         return self._series.name
 
+    @property
+    def artifacts(self):
+        """Artifact that is the source of the column.
+
+        This property is read-only.
+
+        Returns
+        -------
+        tuple of qiime2.Artifact
+            Source artifact of the column.
+
+        """
+        if self._source_metadata is None:
+            return ()
+        if self._source_metadata._source_artifact is not None:
+            return (self._source_metadata._source_artifact,)
+
+        name = self._series.name
+        old_md = self._source_metadata
+        new_md = self._source_metadata._column_sources[name]
+        while True:
+            if new_md is None:
+                if old_md._source_artifact is not None:
+                    return (old_md._source_artifact,)
+                return ()
+            if name in new_md._column_sources:
+                old_md = new_md
+                new_md = new_md._column_sources[name]
+            else:
+                name = old_md._column_names[name]
+                old_md = new_md
+                new_md = new_md._column_sources[name]
+
     def __init__(self, series):
         if not isinstance(series, pd.Series):
             raise TypeError(
@@ -878,6 +1003,10 @@ class MetadataColumn(_MetadataBase, metaclass=abc.ABCMeta):
                 (self.__class__.__name__, series.name, series.dtype))
 
         self._series = self._normalize_(series)
+        self._source_metadata = None
+
+    def _init(self, md):
+        self._source_metadata = md
 
     def __repr__(self):
         """String summary of the metadata column."""
@@ -909,7 +1038,12 @@ class MetadataColumn(_MetadataBase, metaclass=abc.ABCMeta):
         return (
             super().__eq__(other) and
             self.name == other.name and
-            self._series.equals(other._series)
+            self._series.equals(other._series) and
+            # TODO: Consider how to handle this equality
+            # My initial inclination was to make this test for equalty of
+            # _source_metadata, but this seriously messes with some of the
+            # rountrip tests in test_io, so it looks like this for now
+            self.artifacts == other.artifacts
         )
 
     def __ne__(self, other):
@@ -1103,7 +1237,7 @@ class MetadataColumn(_MetadataBase, metaclass=abc.ABCMeta):
         filtered_series = self._filter_ids_helper(self._series, self.get_ids(),
                                                   ids_to_keep)
         filtered_mdc = self.__class__(filtered_series)
-        filtered_mdc._add_artifacts(self.artifacts)
+        filtered_mdc._init(self._source_metadata)
         return filtered_mdc
 
 
