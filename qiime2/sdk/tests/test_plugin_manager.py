@@ -10,11 +10,13 @@ import unittest
 
 import qiime2.plugin
 import qiime2.sdk
-from qiime2.plugin.plugin import SemanticTypeRecord, FormatRecord
+
+from qiime2.plugin.plugin import SemanticTypeRecord  # , FormatRecord
 
 from qiime2.core.testing.type import (IntSequence1, IntSequence2, Mapping,
                                       FourInts, Kennel, Dog, Cat, SingleInt,
                                       C1, C2, C3, Foo, Bar, Baz)
+"""
 from qiime2.core.testing.format import (IntSequenceDirectoryFormat,
                                         MappingDirectoryFormat,
                                         IntSequenceV2DirectoryFormat,
@@ -24,6 +26,7 @@ from qiime2.core.testing.format import (IntSequenceDirectoryFormat,
                                         RedundantSingleIntDirectoryFormat,
                                         EchoFormat,
                                         EchoDirectoryFormat)
+"""
 from qiime2.core.testing.util import get_dummy_plugin
 
 
@@ -39,8 +42,8 @@ class TestPluginManager(unittest.TestCase):
         exp = {'dummy-plugin': self.plugin}
         self.assertEqual(plugins, exp)
 
-    def test_semantic_types(self):
-        types = self.pm.semantic_types
+    def test_type_fragments(self):
+        types = self.pm.type_fragments
 
         exp = {
             'IntSequence1': SemanticTypeRecord(semantic_type=IntSequence1,
@@ -75,20 +78,67 @@ class TestPluginManager(unittest.TestCase):
 
         self.assertEqual(types, exp)
 
-    def test_importable_types(self):
-        types = self.pm.importable_types
+    def test_get_semantic_types(self):
+        types = self.pm.get_semantic_types()
 
-        exp = {IntSequence1, IntSequence2, FourInts, Mapping, Kennel[Dog],
-               Kennel[Cat], SingleInt}
+        exp = set([SemanticTypeRecord(semantic_type=IntSequence1,
+                                      plugin=self.plugin),
+                   SemanticTypeRecord(semantic_type=IntSequence2,
+                                      plugin=self.plugin),
+                   SemanticTypeRecord(semantic_type=Mapping,
+                                      plugin=self.plugin),
+                   SemanticTypeRecord(semantic_type=FourInts,
+                                      plugin=self.plugin),
+                   SemanticTypeRecord(semantic_type=Kennel[Dog],
+                                      plugin=self.plugin),
+                   SemanticTypeRecord(semantic_type=Kennel[Cat],
+                                      plugin=self.plugin),
+                   SemanticTypeRecord(semantic_type=SingleInt,
+                                      plugin=self.plugin)])
+
         self.assertLessEqual(exp, types)
         self.assertNotIn(Cat, types)
         self.assertNotIn(Dog, types)
         self.assertNotIn(Kennel, types)
 
     # TODO: add tests for type/directory/transformer registrations
+    def test_get_formats_include_all_formats(self):
+        obs = self.pm.formats
+        exp = self.pm.get_formats(include_all=True, importable=False,
+                                  exportable=False, canonical_format=False)
 
+        self.assertEqual(obs, exp)
+
+    def test_get_formats_importable_formats(self):
+        obs = self.pm._importable
+        exp = self.pm.get_formats(include_all=False, importable=True,
+                                  exportable=False, canonical_format=False)
+
+        self.assertEqual(obs, exp)
+
+    def test_get_formats_exportable_formats(self):
+        obs = self.pm._exportable
+        exp = self.pm.get_formats(include_all=False, importable=False,
+                                  exportable=True, canonical_format=False)
+
+        self.assertEqual(obs, exp)
+
+    def test_get_formats_canonical_formats(self):
+        obs = self.pm._canonical_formats
+        exp = self.pm.get_formats(include_all=False, importable=False,
+                                  exportable=False, canonical_format=True)
+
+        self.assertEqual(obs, exp)
+
+    def test_get_formats_invalid(self):
+        with self.assertRaisesRegex(ValueError, "cannot be included"):
+            self.pm.get_formats(include_all=True, importable=False,
+                                exportable=True, canonical_format=True)
+
+    # TODO: Need to determine the correct format to use for this test
+    """
     def test_importable_formats(self):
-        obs = self.pm.importable_formats
+        obs = self.pm._importable
         exp = {
             'IntSequenceDirectoryFormat':
                 FormatRecord(format=IntSequenceDirectoryFormat,
@@ -121,13 +171,14 @@ class TestPluginManager(unittest.TestCase):
         self.assertEqual(obs, exp)
 
     def test_importable_formats_excludes_unimportables(self):
-        obs = self.pm.importable_formats
+        obs = self.pm._importable
         self.assertNotIn('UnimportableFormat', obs)
         self.assertNotIn('UnimportableDirectoryFormat', obs)
 
         obs = self.pm.formats
         self.assertIn('UnimportableFormat', obs)
         self.assertIn('UnimportableDirectoryFormat', obs)
+    """
 
 
 if __name__ == '__main__':
